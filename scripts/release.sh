@@ -12,14 +12,20 @@
 # (veilens.zip + headgate.zip from releases/latest); they have no build-time tie
 # to cli, so they just go first. The tap MUST come after cli: update-formula.sh
 # downloads the cli release asset to compute its sha256, so the asset has to
-# exist first. This script enforces all of that by waiting for each asset to
-# appear before moving on.
+# exist first. This script waits for each asset to appear before moving on.
+#
+# VERSION is figured out automatically: the highest vX.Y.Z tag across the three
+# release repos, patch-bumped (--minor / --major to bump elsewhere). With no tags
+# yet, the cli Homebrew formula's version seeds the first release. Pass an
+# explicit vX.Y.Z to override. The run is non-interactive (no prompts); use
+# --dry-run to print the resolved version + plan and exit.
 #
 # Layout: the repos are siblings under one umbrella dir (headgate/, cli/,
 # homebrew-tap/ next to this veilens/ checkout). Override with HEADGATE_DIR /
 # CLI_DIR / TAP_DIR if yours differ.
 #
-#   Usage: scripts/release.sh vX.Y.Z [--skip-engine] [--skip-headgate] [--skip-tap] [-y]
+#   Usage: scripts/release.sh [vX.Y.Z] [--major|--minor|--patch]
+#                             [--skip-engine] [--skip-headgate] [--skip-tap] [--dry-run]
 #
 set -euo pipefail
 
@@ -44,14 +50,17 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"   # seconds to wait for a CI asset (engine 
 POLL_INTERVAL="${POLL_INTERVAL:-20}"
 
 # -- args ---------------------------------------------------------------------
-VERSION="" SKIP_ENGINE=0 SKIP_HEADGATE=0 SKIP_TAP=0 ASSUME_YES=0
+VERSION="" BUMP="patch" SKIP_ENGINE=0 SKIP_HEADGATE=0 SKIP_TAP=0 DRY_RUN=0
 for a in "$@"; do
   case "$a" in
+    --major)         BUMP="major" ;;
+    --minor)         BUMP="minor" ;;
+    --patch)         BUMP="patch" ;;
     --skip-engine)   SKIP_ENGINE=1 ;;
     --skip-headgate) SKIP_HEADGATE=1 ;;
     --skip-tap)      SKIP_TAP=1 ;;
-    -y|--yes)        ASSUME_YES=1 ;;
-    -h|--help)       sed -n '2,30p' "$0"; exit 0 ;;
+    --dry-run)       DRY_RUN=1 ;;
+    -h|--help)       sed -n '2,33p' "$0"; exit 0 ;;
     -*)              echo "unknown option: $a" >&2; exit 2 ;;
     *)               [ -z "$VERSION" ] && VERSION="$a" || { echo "unexpected argument: $a" >&2; exit 2; } ;;
   esac
@@ -62,9 +71,62 @@ log()  { printf '==> %s\n' "$*" >&2; }
 warn() { printf '!! %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Every vX.Y.Z tag across the release repos, one per line (deduped, sorted).
+all_release_tags() {
+  local dir
+  for dir in "$ENGINE_DIR" "$HEADGATE_DIR" "$CLI_DIR"; do
+    git -C "$dir" ls-remote --tags origin 2>/dev/null \
+      | sed -E 's#.*refs/tags/##; s#\^\{\}$##' \
+      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
+  done | sort -u -V
+}
+
+# bump_semver vX.Y.Z {major|minor|patch} -> vX'.Y'.Z'
+bump_semver() {
+  local v="${1#v}" part="$2" M m p
+  IFS=. read -r M m p <<< "$v"
+  case "$part" in
+    major) M=$((M + 1)); m=0; p=0 ;;
+    minor) m=$((m + 1)); p=0 ;;
+    *)     p=$((p + 1)) ;;
+  esac
+  printf 'v%s.%s.%s\n' "$M" "$m" "$p"
+}
+
+# Formula version (e.g. 0.1.1) -> seed for the very first release.
+formula_version() {
+  grep -E '^[[:space:]]*version' "$CLI_DIR/dist/homebrew/$TAP_FORMULA" 2>/dev/null \
+    | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+# Resolve VERSION: explicit arg wins; else bump the highest existing tag; else
+# seed from the formula version. Then ensure it collides with no existing tag.
+resolve_version() {
+  local tags latest fv
+  tags="$(all_release_tags)"
+  latest="$(printf '%s\n' "$tags" | grep -E '^v' | tail -1 || true)"
+
+  if [ -n "$VERSION" ]; then
+    [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "explicit version must look like vX.Y.Z (got '$VERSION')"
+  elif [ -n "$latest" ]; then
+    VERSION="$(bump_semver "$latest" "$BUMP")"
+    log "latest released tag is $latest -> $BUMP-bumped to $VERSION"
+  else
+    fv="$(formula_version)"
+    VERSION="v${fv:-0.1.0}"
+    log "no existing release tags -> seeding first release from formula: $VERSION"
+  fi
+
+  while printf '%s\n' "$tags" | grep -qx "$VERSION"; do
+    local nxt; nxt="$(bump_semver "$VERSION" patch)"
+    warn "tag $VERSION already exists -> bumping to $nxt"
+    VERSION="$nxt"
+  done
+}
+
 # Tag the repo at $1 with $VERSION and push it, so CI fires. Refuses if the
-# working tree is dirty, the local branch is ahead of its remote (CI would build
-# a commit GitHub hasn't seen), or the tag already exists remotely.
+# working tree is dirty or the local branch is ahead of its remote (CI would
+# build a commit GitHub hasn't seen).
 tag_and_push() {
   local dir="$1" repo="$2"
   [ -d "$dir/.git" ] || die "$dir is not a git repo (set HEADGATE_DIR/CLI_DIR/TAP_DIR?)"
@@ -105,13 +167,13 @@ wait_for_asset() {
 }
 
 # -- preflight ----------------------------------------------------------------
-[ -n "$VERSION" ] || die "usage: scripts/release.sh vX.Y.Z [--skip-engine] [--skip-headgate] [--skip-tap] [-y]"
-[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]] || die "version must look like vX.Y.Z (got '$VERSION')"
 command -v gh  >/dev/null || die "gh CLI not found"
 command -v curl >/dev/null || die "curl not found"
 gh auth status >/dev/null 2>&1 || die "gh not authenticated (run: gh auth login)"
 [ -x "$CLI_DIR/dist/homebrew/update-formula.sh" ] || die "missing $CLI_DIR/dist/homebrew/update-formula.sh"
 [ -d "$TAP_DIR/.git" ] || die "tap repo not found at $TAP_DIR (set TAP_DIR)"
+
+resolve_version
 
 echo
 log "Release plan for $VERSION"
@@ -120,9 +182,9 @@ log "Release plan for $VERSION"
 echo                         "    3. cli       $CLI_REPO  -> $CLI_ASSET"
 [ "$SKIP_TAP" = 0 ]      && echo "    4. tap       formula bump -> $TAP_DIR/Formula/$TAP_FORMULA" || echo "    4. tap       (skipped)"
 echo
-if [ "$ASSUME_YES" = 0 ]; then
-  read -r -p "Proceed? [y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || { echo "aborted."; exit 1; }
+if [ "$DRY_RUN" = 1 ]; then
+  log "dry run -- no tags pushed."
+  exit 0
 fi
 
 # -- 1. engine (veilens.zip) --------------------------------------------------
@@ -168,4 +230,4 @@ if [ "$SKIP_TAP" = 0 ]; then
 fi
 
 echo
-log "Done. Install with:  brew install veilensapp/tap/veilens"
+log "Done ($VERSION). Install with:  brew install veilensapp/tap/veilens"
