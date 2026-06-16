@@ -3,102 +3,109 @@
 # Coordinated release for the veilens stack. Tags each repo so its CI builds and
 # attaches the release asset, in dependency order:
 #
-#   1. veilens   (this repo)  → veilens-zip.yml attaches veilens.zip
-#   2. cli                    → release.yml     attaches veilens-macos.tar.gz
-#   3. homebrew-tap           → formula bumped to the cli asset's url + sha256
+#   1. veilens   (this repo)  -> veilens-zip.yml  attaches veilens.zip
+#   2. headgate               -> headgate-zip.yml attaches headgate.zip
+#   3. cli                    -> release.yml      attaches veilens-macos.tar.gz
+#   4. homebrew-tap           -> formula bumped to the cli asset's url + sha256
 #
-# The tap MUST come after cli: update-formula.sh downloads the cli release asset
-# to compute its sha256, so the asset has to exist first. This script enforces
-# that by waiting for each asset to appear before moving on.
+# The engine + headgate are the assets the CLI's Bootstrapper fetches at runtime
+# (veilens.zip + headgate.zip from releases/latest); they have no build-time tie
+# to cli, so they just go first. The tap MUST come after cli: update-formula.sh
+# downloads the cli release asset to compute its sha256, so the asset has to
+# exist first. This script enforces all of that by waiting for each asset to
+# appear before moving on.
 #
-# Layout: the repos are siblings under one umbrella dir (cli/, homebrew-tap/
-# next to this veilens/ checkout). Override with CLI_DIR / TAP_DIR if yours
-# differ. The headgate.zip the CLI also fetches at runtime is released out of
-# band from veilensapp/headgate — not driven by this script.
+# Layout: the repos are siblings under one umbrella dir (headgate/, cli/,
+# homebrew-tap/ next to this veilens/ checkout). Override with HEADGATE_DIR /
+# CLI_DIR / TAP_DIR if yours differ.
 #
-#   Usage: scripts/release.sh vX.Y.Z [--skip-engine] [--skip-tap] [-y]
+#   Usage: scripts/release.sh vX.Y.Z [--skip-engine] [--skip-headgate] [--skip-tap] [-y]
 #
 set -euo pipefail
 
-# ── locations ────────────────────────────────────────────────────────────────
+# -- locations ----------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"          # the veilens repo
 UMBRELLA="$(cd "$ENGINE_DIR/.." && pwd)"
+HEADGATE_DIR="${HEADGATE_DIR:-$UMBRELLA/headgate}"
 CLI_DIR="${CLI_DIR:-$UMBRELLA/cli}"
 TAP_DIR="${TAP_DIR:-$UMBRELLA/homebrew-tap}"
 
 ENGINE_REPO="${ENGINE_REPO:-veilensapp/veilens}"
+HEADGATE_REPO="${HEADGATE_REPO:-veilensapp/headgate}"
 CLI_REPO="${CLI_REPO:-veilensapp/cli}"
 
 ENGINE_ASSET="veilens.zip"
+HEADGATE_ASSET="headgate.zip"
 CLI_ASSET="veilens-macos.tar.gz"
 TAP_FORMULA="veilens.rb"
 
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"   # seconds to wait for a CI asset (engine build ~20m+)
 POLL_INTERVAL="${POLL_INTERVAL:-20}"
 
-# ── args ─────────────────────────────────────────────────────────────────────
-VERSION="" SKIP_ENGINE=0 SKIP_TAP=0 ASSUME_YES=0
+# -- args ---------------------------------------------------------------------
+VERSION="" SKIP_ENGINE=0 SKIP_HEADGATE=0 SKIP_TAP=0 ASSUME_YES=0
 for a in "$@"; do
   case "$a" in
-    --skip-engine) SKIP_ENGINE=1 ;;
-    --skip-tap)    SKIP_TAP=1 ;;
-    -y|--yes)      ASSUME_YES=1 ;;
-    -h|--help)     sed -n '2,30p' "$0"; exit 0 ;;
-    -*)            echo "unknown option: $a" >&2; exit 2 ;;
-    *)             [ -z "$VERSION" ] && VERSION="$a" || { echo "unexpected argument: $a" >&2; exit 2; } ;;
+    --skip-engine)   SKIP_ENGINE=1 ;;
+    --skip-headgate) SKIP_HEADGATE=1 ;;
+    --skip-tap)      SKIP_TAP=1 ;;
+    -y|--yes)        ASSUME_YES=1 ;;
+    -h|--help)       sed -n '2,30p' "$0"; exit 0 ;;
+    -*)              echo "unknown option: $a" >&2; exit 2 ;;
+    *)               [ -z "$VERSION" ] && VERSION="$a" || { echo "unexpected argument: $a" >&2; exit 2; } ;;
   esac
 done
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-log()  { printf '\033[1;36m==>\033[0m %s\n' "$*" >&2; }
-warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+# -- helpers ------------------------------------------------------------------
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf '!! %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 # Tag the repo at $1 with $VERSION and push it, so CI fires. Refuses if the
 # working tree is dirty, the local branch is ahead of its remote (CI would build
 # a commit GitHub hasn't seen), or the tag already exists remotely.
 tag_and_push() {
   local dir="$1" repo="$2"
-  [ -d "$dir/.git" ] || die "$dir is not a git repo (set CLI_DIR/TAP_DIR?)"
+  [ -d "$dir/.git" ] || die "$dir is not a git repo (set HEADGATE_DIR/CLI_DIR/TAP_DIR?)"
   ( cd "$dir"
-    [ -z "$(git status --porcelain)" ] || die "$repo working tree is dirty — commit or stash first"
+    [ -z "$(git status --porcelain)" ] || die "$repo working tree is dirty -- commit or stash first"
     local branch; branch="$(git symbolic-ref --quiet --short HEAD || true)"
     [ -n "$branch" ] || die "$repo is in detached HEAD"
     git fetch -q origin
     if git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null; then
       [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$branch")" ] \
-        || die "$repo: local $branch differs from origin/$branch — push (or pull) first"
+        || die "$repo: local $branch differs from origin/$branch -- push (or pull) first"
     fi
     if git ls-remote --tags --exit-code origin "refs/tags/$VERSION" >/dev/null 2>&1; then
-      warn "$repo: tag $VERSION already on origin — skipping tag/push (will still wait for its asset)"
+      warn "$repo: tag $VERSION already on origin -- skipping tag/push (will still wait for its asset)"
       return 0
     fi
     log "$repo: tagging $VERSION at $(git rev-parse --short HEAD) and pushing"
     git tag -a "$VERSION" -m "$repo $VERSION"
     git push -q origin "$VERSION"
   )
-  log "$repo: tag pushed — CI: https://github.com/$repo/actions"
+  log "$repo: tag pushed -- CI: https://github.com/$repo/actions"
 }
 
 # Poll the GitHub Release for $VERSION until the named asset shows up.
 wait_for_asset() {
   local repo="$1" asset="$2" elapsed=0
-  log "waiting for $repo $VERSION/$asset (timeout ${WAIT_TIMEOUT}s)…"
+  log "waiting for $repo $VERSION/$asset (timeout ${WAIT_TIMEOUT}s)..."
   while true; do
     if gh release view "$VERSION" --repo "$repo" --json assets \
          --jq '.assets[].name' 2>/dev/null | grep -qx "$asset"; then
-      log "$repo: $asset is published ✓"
+      log "$repo: $asset is published"
       return 0
     fi
     (( elapsed >= WAIT_TIMEOUT )) && die "timed out waiting for $repo $VERSION/$asset (check the Actions tab)"
     sleep "$POLL_INTERVAL"; elapsed=$((elapsed + POLL_INTERVAL))
-    printf '    …%ss elapsed\n' "$elapsed" >&2
+    printf '    ...%ss elapsed\n' "$elapsed" >&2
   done
 }
 
-# ── preflight ────────────────────────────────────────────────────────────────
-[ -n "$VERSION" ] || die "usage: scripts/release.sh vX.Y.Z [--skip-engine] [--skip-tap] [-y]"
+# -- preflight ----------------------------------------------------------------
+[ -n "$VERSION" ] || die "usage: scripts/release.sh vX.Y.Z [--skip-engine] [--skip-headgate] [--skip-tap] [-y]"
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]] || die "version must look like vX.Y.Z (got '$VERSION')"
 command -v gh  >/dev/null || die "gh CLI not found"
 command -v curl >/dev/null || die "curl not found"
@@ -108,26 +115,33 @@ gh auth status >/dev/null 2>&1 || die "gh not authenticated (run: gh auth login)
 
 echo
 log "Release plan for $VERSION"
-[ "$SKIP_ENGINE" = 0 ] && echo "    1. engine  $ENGINE_REPO  → $ENGINE_ASSET" || echo "    1. engine  (skipped)"
-echo                       "    2. cli     $CLI_REPO  → $CLI_ASSET"
-[ "$SKIP_TAP" = 0 ]    && echo "    3. tap     formula bump → $TAP_DIR/Formula/$TAP_FORMULA" || echo "    3. tap     (skipped)"
+[ "$SKIP_ENGINE" = 0 ]   && echo "    1. engine    $ENGINE_REPO  -> $ENGINE_ASSET"     || echo "    1. engine    (skipped)"
+[ "$SKIP_HEADGATE" = 0 ] && echo "    2. headgate  $HEADGATE_REPO  -> $HEADGATE_ASSET" || echo "    2. headgate  (skipped)"
+echo                         "    3. cli       $CLI_REPO  -> $CLI_ASSET"
+[ "$SKIP_TAP" = 0 ]      && echo "    4. tap       formula bump -> $TAP_DIR/Formula/$TAP_FORMULA" || echo "    4. tap       (skipped)"
 echo
 if [ "$ASSUME_YES" = 0 ]; then
   read -r -p "Proceed? [y/N] " ans
   [[ "$ans" =~ ^[Yy]$ ]] || { echo "aborted."; exit 1; }
 fi
 
-# ── 1. engine (veilens.zip) ──────────────────────────────────────────────────
+# -- 1. engine (veilens.zip) --------------------------------------------------
 if [ "$SKIP_ENGINE" = 0 ]; then
   tag_and_push "$ENGINE_DIR" "$ENGINE_REPO"
   wait_for_asset "$ENGINE_REPO" "$ENGINE_ASSET"
 fi
 
-# ── 2. cli (veilens-macos.tar.gz) — must finish before the tap ───────────────
+# -- 2. headgate (headgate.zip) -----------------------------------------------
+if [ "$SKIP_HEADGATE" = 0 ]; then
+  tag_and_push "$HEADGATE_DIR" "$HEADGATE_REPO"
+  wait_for_asset "$HEADGATE_REPO" "$HEADGATE_ASSET"
+fi
+
+# -- 3. cli (veilens-macos.tar.gz) -- must finish before the tap --------------
 tag_and_push "$CLI_DIR" "$CLI_REPO"
 wait_for_asset "$CLI_REPO" "$CLI_ASSET"
 
-# ── 3. tap (formula → cli's published asset) ─────────────────────────────────
+# -- 4. tap (formula -> cli's published asset) --------------------------------
 if [ "$SKIP_TAP" = 0 ]; then
   log "tap: regenerating formula from $CLI_REPO $VERSION asset"
   ( cd "$CLI_DIR" && VEILENS_REPO="$CLI_REPO" dist/homebrew/update-formula.sh "$VERSION" )
@@ -144,12 +158,12 @@ if [ "$SKIP_TAP" = 0 ]; then
 
   ( cd "$TAP_DIR"
     if [ -z "$(git status --porcelain "Formula/$TAP_FORMULA")" ]; then
-      warn "tap: Formula/$TAP_FORMULA unchanged for $VERSION — nothing to publish"
+      warn "tap: Formula/$TAP_FORMULA unchanged for $VERSION -- nothing to publish"
     else
       git add "Formula/$TAP_FORMULA"
       git commit -q -m "veilens ${VERSION#v}"
       git push -q origin HEAD
-      log "tap: published Formula/$TAP_FORMULA for $VERSION ✓"
+      log "tap: published Formula/$TAP_FORMULA for $VERSION"
     fi )
 fi
 
