@@ -25,7 +25,7 @@
 # CLI_DIR / TAP_DIR if yours differ.
 #
 #   Usage: scripts/release.sh [vX.Y.Z] [--major|--minor|--patch]
-#                             [--skip-engine] [--skip-headgate] [--skip-tap] [--dry-run]
+#                  [--skip-engine] [--skip-headgate] [--skip-app] [--skip-tap] [--dry-run]
 #
 set -euo pipefail
 
@@ -34,15 +34,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"          # the veilens repo
 UMBRELLA="$(cd "$ENGINE_DIR/.." && pwd)"
 HEADGATE_DIR="${HEADGATE_DIR:-$UMBRELLA/headgate}"
+APP_DIR="${APP_DIR:-$UMBRELLA/app}"
 CLI_DIR="${CLI_DIR:-$UMBRELLA/cli}"
 TAP_DIR="${TAP_DIR:-$UMBRELLA/homebrew-tap}"
 
 ENGINE_REPO="${ENGINE_REPO:-veilensapp/veilens}"
 HEADGATE_REPO="${HEADGATE_REPO:-veilensapp/headgate}"
+APP_REPO="${APP_REPO:-veilensapp/app}"
 CLI_REPO="${CLI_REPO:-veilensapp/cli}"
 
 ENGINE_ASSET="veilens.zip"
 HEADGATE_ASSET="headgate.zip"
+APP_ASSET="veilens-app.zip"
 CLI_ASSET="veilens-macos.tar.gz"
 TAP_FORMULA="veilens.rb"
 
@@ -50,7 +53,7 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"   # seconds to wait for a CI asset (engine 
 POLL_INTERVAL="${POLL_INTERVAL:-20}"
 
 # -- args ---------------------------------------------------------------------
-VERSION="" BUMP="patch" SKIP_ENGINE=0 SKIP_HEADGATE=0 SKIP_TAP=0 DRY_RUN=0
+VERSION="" BUMP="patch" SKIP_ENGINE=0 SKIP_HEADGATE=0 SKIP_APP=0 SKIP_TAP=0 DRY_RUN=0
 for a in "$@"; do
   case "$a" in
     --major)         BUMP="major" ;;
@@ -58,6 +61,7 @@ for a in "$@"; do
     --patch)         BUMP="patch" ;;
     --skip-engine)   SKIP_ENGINE=1 ;;
     --skip-headgate) SKIP_HEADGATE=1 ;;
+    --skip-app)      SKIP_APP=1 ;;
     --skip-tap)      SKIP_TAP=1 ;;
     --dry-run)       DRY_RUN=1 ;;
     -h|--help)       sed -n '2,33p' "$0"; exit 0 ;;
@@ -74,7 +78,7 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # Every vX.Y.Z tag across the release repos, one per line (deduped, sorted).
 all_release_tags() {
   local dir
-  for dir in "$ENGINE_DIR" "$HEADGATE_DIR" "$CLI_DIR"; do
+  for dir in "$ENGINE_DIR" "$HEADGATE_DIR" "$APP_DIR" "$CLI_DIR"; do
     git -C "$dir" ls-remote --tags origin 2>/dev/null \
       | sed -E 's#.*refs/tags/##; s#\^\{\}$##' \
       | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
@@ -179,8 +183,9 @@ echo
 log "Release plan for $VERSION"
 [ "$SKIP_ENGINE" = 0 ]   && echo "    1. engine    $ENGINE_REPO  -> $ENGINE_ASSET"     || echo "    1. engine    (skipped)"
 [ "$SKIP_HEADGATE" = 0 ] && echo "    2. headgate  $HEADGATE_REPO  -> $HEADGATE_ASSET" || echo "    2. headgate  (skipped)"
-echo                         "    3. cli       $CLI_REPO  -> $CLI_ASSET"
-[ "$SKIP_TAP" = 0 ]      && echo "    4. tap       formula bump -> $TAP_DIR/Formula/$TAP_FORMULA" || echo "    4. tap       (skipped)"
+[ "$SKIP_APP" = 0 ]      && echo "    3. app       $APP_REPO  -> $APP_ASSET"           || echo "    3. app       (skipped)"
+echo                         "    4. cli       $CLI_REPO  -> $CLI_ASSET"
+[ "$SKIP_TAP" = 0 ]      && echo "    5. tap       formula bump -> $TAP_DIR/Formula/$TAP_FORMULA" || echo "    5. tap       (skipped)"
 echo
 if [ "$DRY_RUN" = 1 ]; then
   log "dry run -- no tags pushed."
@@ -199,11 +204,18 @@ if [ "$SKIP_HEADGATE" = 0 ]; then
   wait_for_asset "$HEADGATE_REPO" "$HEADGATE_ASSET"
 fi
 
-# -- 3. cli (veilens-macos.tar.gz) -- must finish before the tap --------------
+# -- 3. app (veilens-app.zip: ws_server source + web/dist) --------------------
+# Independent of cli (the CLI builds it on-device against headgate at install).
+if [ "$SKIP_APP" = 0 ]; then
+  tag_and_push "$APP_DIR" "$APP_REPO"
+  wait_for_asset "$APP_REPO" "$APP_ASSET"
+fi
+
+# -- 4. cli (veilens-macos.tar.gz) -- must finish before the tap --------------
 tag_and_push "$CLI_DIR" "$CLI_REPO"
 wait_for_asset "$CLI_REPO" "$CLI_ASSET"
 
-# -- 4. tap (formula -> cli's published asset) --------------------------------
+# -- 5. tap (formula -> cli's published asset) --------------------------------
 if [ "$SKIP_TAP" = 0 ]; then
   log "tap: regenerating formula from $CLI_REPO $VERSION asset"
   ( cd "$CLI_DIR" && VEILENS_REPO="$CLI_REPO" dist/homebrew/update-formula.sh "$VERSION" )
